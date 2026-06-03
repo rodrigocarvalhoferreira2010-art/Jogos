@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<title>Top-Down Shooter</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0f; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: 'Courier New', monospace; overflow: hidden; }
+  canvas { border: 1px solid #1a1a2e; display: block; cursor: crosshair; }
+  #ui { color: #ccc; font-size: 12px; margin-top: 8px; opacity: 0.5; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">WASD mover · Rato mirar · Clique disparar · R recarregar</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const W = 800, H = 600;
+canvas.width = W;
+canvas.height = H;
+
+// ── Paleta ──────────────────────────────────────────
+const COL = {
+  bg: '#0d0d18',
+  grid: '#12122a',
+  player: '#4af',
+  playerGlow: 'rgba(68,170,255,0.3)',
+  bullet: '#ffe066',
+  bulletGlow: 'rgba(255,224,102,0.4)',
+  enemy: ['#f45', '#f84', '#c3f', '#4f8'],
+  enemyGlow: ['rgba(255,68,85,0.3)', 'rgba(255,136,68,0.3)', 'rgba(204,51,255,0.3)', 'rgba(68,255,136,0.3)'],
+  hp: '#2ecc71',
+  hpLow: '#e74c3c',
+  xp: '#9b59b6',
+  ui: '#eee',
+  uiDim: '#666',
+};
+
+// ── Estado do jogo ───────────────────────────────────
+let state = 'menu'; // menu | playing | dead
+let score, wave, kills, xp, level;
+let player, bullets, enemies, particles, floatingTexts;
+let spawnTimer, waveTimer, waveActive, waveEnemiesLeft;
+let keys = {};
+let mouse = { x: W / 2, y: H / 2, down: false };
+let camX = 0, camY = 0;
+let shake = 0;
+let shootCooldown = 0;
+let reloading = false;
+let reloadTimer = 0;
+let ammo, maxAmmo;
+
+// Visibilidade da janela — se o tab estiver inativo, o shake para
+let documentVisible = true;
+document.addEventListener('visibilitychange', () => {
+  documentVisible = !document.hidden;
+  if (!documentVisible) shake = 0;
+});
+
+// Mundo maior que o ecrã
+const WORLD_W = 1600;
+const WORLD_H = 1200;
+
+function initGame() {
+  score = 0; wave = 0; kills = 0; xp = 0; level = 1;
+  ammo = 12; maxAmmo = 12;
+  shootCooldown = 0; reloading = false; reloadTimer = 0;
+  spawnTimer = 0; waveTimer = 180; waveActive = false; waveEnemiesLeft = 0;
+  shake = 0;
+
+  player = {
+    x: WORLD_W / 2, y: WORLD_H / 2,
+    r: 14, speed: 3.2,
+    hp: 100, maxHp: 100,
+    angle: 0,
+    vx: 0, vy: 0,
+    iframes: 0,
+    xpToNext: 20,
+  };
+
+  bullets = []; enemies = []; particles = []; floatingTexts = [];
+  camX = player.x - W / 2;
+  camY = player.y - H / 2;
+  state = 'playing';
+}
+
+// ── Input ────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key.toLowerCase() === 'r' && !reloading && ammo < maxAmmo && state === 'playing') startReload();
+  if ((e.key === ' ' || e.key === 'Enter') && state === 'menu') initGame();
+  if ((e.key === ' ' || e.key === 'Enter') && state === 'dead') state = 'menu';
+  e.preventDefault && ['arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase()) && e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown', () => { mouse.down = true; });
+canvas.addEventListener('mouseup', () => { mouse.down = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ── Helpers ──────────────────────────────────────────
+function lerp(a, b, t) { return a + (b - a) * t; }
+function dist(a, b) { return Math.hypot(a.x - b.x, b.y - b.y); }
+function clamp(v, min, max) { return Math.min(Math.max(v, min), max); }
+function rand(min, max) { return Math.random() * (max - min) + min; }
+function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
+
+function spawnParticles(x, y, color, count = 8, speed = 3) {
+  for (let i = 0; i < count; i++) {
+    const angle = rand(0, Math.PI * 2);
+    const s = rand(0.5, speed);
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * s,
+      vy: Math.sin(angle) * s,
+      life: 1, decay: rand(0.02, 0.05),
+      r: rand(2, 5), color
+    });
+  }
+}
+
+function addFloat(x, y, text, color = '#fff') {
+  floatingTexts.push({ x, y, text, color, life: 1, vy: -1.2 });
+}
+
+function startReload() {
+  reloading = true;
+  reloadTimer = 120; // 2 segundos a 60fps
+}
+
+// ── Spawn inimigos ───────────────────────────────────
+function spawnEnemy() {
+  const types = [
+    { r: 14, speed: 1.4, hp: 30, dmg: 10, score: 10, type: 0 },   // básico
+    { r: 18, speed: 0.9, hp: 70, dmg: 20, score: 25, type: 1 },   // tanque
+    { r: 10, speed: 2.4, hp: 18, dmg: 8,  score: 15, type: 2 },   // rápido
+    { r: 22, speed: 0.6, hp: 150, dmg: 30, score: 50, type: 3 },  // boss mini
+  ];
+
+  let typeIdx = 0;
+  const r = Math.random();
+  if (wave >= 5 && r < 0.08) typeIdx = 3;
+  else if (wave >= 3 && r < 0.2) typeIdx = 1;
+  else if (wave >= 2 && r < 0.35) typeIdx = 2;
+
+  const t = { ...types[typeIdx] };
+  t.maxHp = t.hp;
+  t.hp = t.hp + wave * 5;
+  t.maxHp = t.hp;
+
+  // Spawn fora do ecrã do jogador
+  const side = randInt(0, 3);
+  const px = player.x, py = player.y;
+  const margin = 300;
+  if (side === 0) { t.x = rand(0, WORLD_W); t.y = py - margin; }
+  else if (side === 1) { t.x = rand(0, WORLD_W); t.y = py + margin; }
+  else if (side === 2) { t.x = px - margin; t.y = rand(0, WORLD_H); }
+  else { t.x = px + margin; t.y = rand(0, WORLD_H); }
+
+  t.x = clamp(t.x, 30, WORLD_W - 30);
+  t.y = clamp(t.y, 30, WORLD_H - 30);
+  t.angle = 0;
+  t.iframes = 0;
+
+  enemies.push(t);
+  waveEnemiesLeft--;
+}
+
+function nextWave() {
+  wave++;
+  const count = 5 + wave * 3;
+  waveEnemiesLeft = count;
+  waveActive = true;
+  spawnTimer = 0;
+  addFloat(player.x, player.y - 40, `Onda ${wave}!`, '#ffe066');
+}
+
+// ── Disparar ─────────────────────────────────────────
+function shoot() {
+  if (ammo <= 0 || reloading || shootCooldown > 0) return;
+  const wx = mouse.x + camX;
+  const wy = mouse.y + camY;
+  const angle = Math.atan2(wy - player.y, wx - player.x);
+  const spread = (Math.random() - 0.5) * 0.06;
+  const spd = 9;
+  bullets.push({
+    x: player.x + Math.cos(angle) * 20,
+    y: player.y + Math.sin(angle) * 20,
+    vx: Math.cos(angle + spread) * spd,
+    vy: Math.sin(angle + spread) * spd,
+    life: 1, range: 500, traveled: 0,
+    dmg: 20 + (level - 1) * 3,
+  });
+  ammo--;
+  shootCooldown = 10;
+  if (ammo === 0) startReload();
+}
+
+// ── Levelup ──────────────────────────────────────────
+function checkLevelUp() {
+  if (xp >= player.xpToNext) {
+    xp -= player.xpToNext;
+    level++;
+    player.xpToNext = Math.floor(player.xpToNext * 1.4);
+    player.maxHp += 15;
+    player.hp = Math.min(player.hp + 20, player.maxHp);
+    maxAmmo += 2;
+    ammo = maxAmmo;
+    shake = 8;
+    addFloat(player.x, player.y - 50, `LEVEL ${level}!`, '#9b59b6');
+    spawnParticles(player.x, player.y, '#9b59b6', 20, 5);
+  }
+}
+
+// ── Update ───────────────────────────────────────────
+function update() {
+  if (state !== 'playing') return;
+
+  // Câmara com lerp
+  const targetCamX = player.x - W / 2;
+  const targetCamY = player.y - H / 2;
+  camX = lerp(camX, targetCamX, 0.1);
+  camY = lerp(camY, targetCamY, 0.1);
+  camX = clamp(camX, 0, WORLD_W - W);
+  camY = clamp(camY, 0, WORLD_H - H);
+
+  if (shake > 0) shake *= 0.8;
+
+  // Jogador
+  let dx = 0, dy = 0;
+  if (keys['w'] || keys['arrowup'])    dy -= 1;
+  if (keys['s'] || keys['arrowdown'])  dy += 1;
+  if (keys['a'] || keys['arrowleft'])  dx -= 1;
+  if (keys['d'] || keys['arrowright']) dx += 1;
+  if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+  player.x = clamp(player.x + dx * player.speed, player.r, WORLD_W - player.r);
+  player.y = clamp(player.y + dy * player.speed, player.r, WORLD_H - player.r);
+
+  // Mira
+  const wx = mouse.x + camX;
+  const wy = mouse.y + camY;
+  player.angle = Math.atan2(wy - player.y, wx - player.x);
+
+  // Disparo
+  if (shootCooldown > 0) shootCooldown--;
+  if (reloading) {
+    reloadTimer--;
+    if (reloadTimer <= 0) { reloading = false; ammo = maxAmmo; }
+  }
+  if (mouse.down) shoot();
+
+  // Iframes jogador
+  if (player.iframes > 0) player.iframes--;
+
+  // Ondas
+  if (!waveActive) {
+    waveTimer--;
+    if (waveTimer <= 0) { nextWave(); waveTimer = 0; }
+  } else {
+    if (waveEnemiesLeft > 0) {
+      spawnTimer--;
+      if (spawnTimer <= 0) {
+        spawnEnemy();
+        spawnTimer = Math.max(20, 60 - wave * 3);
+      }
+    }
+    if (waveEnemiesLeft <= 0 && enemies.length === 0) {
+      waveActive = false;
+      waveTimer = 180;
+      addFloat(player.x, player.y - 40, 'Onda limpa! +50', '#2ecc71');
+      score += 50;
+    }
+  }
+
+  // Projéteis
+  bullets = bullets.filter(b => {
+    b.x += b.vx; b.y += b.vy;
+    b.traveled += Math.hypot(b.vx, b.vy);
+    if (b.traveled >= b.range) return false;
+    if (b.x < 0 || b.x > WORLD_W || b.y < 0 || b.y > WORLD_H) return false;
+
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      const e = enemies[i];
+      if (Math.hypot(b.x - e.x, b.y - e.y) < e.r + 5) {
+        e.hp -= b.dmg;
+        spawnParticles(b.x, b.y, COL.enemy[e.type], 5, 2.5);
+        addFloat(e.x, e.y - e.r - 10, `-${b.dmg}`, '#f66');
+        if (e.hp <= 0) {
+          score += e.score;
+          kills++;
+          xp += Math.ceil(e.score / 5);
+          spawnParticles(e.x, e.y, COL.enemy[e.type], 18, 4);
+          addFloat(e.x, e.y - 20, `+${e.score}`, '#ffe066');
+          enemies.splice(i, 1);
+          checkLevelUp();
+        }
+        return false;
+      }
+    }
+    return true;
+  });
+
+  // Inimigos
+  enemies.forEach(e => {
+    const angle = Math.atan2(player.y - e.y, player.x - e.x);
+    e.angle = angle;
+    e.x += Math.cos(angle) * e.speed;
+    e.y += Math.sin(angle) * e.speed;
+    e.x = clamp(e.x, e.r, WORLD_W - e.r);
+    e.y = clamp(e.y, e.r, WORLD_H - e.r);
+
+    if (player.iframes === 0 && Math.hypot(e.x - player.x, e.y - player.y) < e.r + player.r) {
+      player.hp -= e.dmg;
+      player.iframes = 60;
+      shake = 12;
+      spawnParticles(player.x, player.y, '#f45', 10, 3);
+      if (player.hp <= 0) { state = 'dead'; shake = 0; }
+    }
+  });
+
+  // Partículas
+  particles = particles.filter(p => {
+    p.x += p.vx; p.y += p.vy;
+    p.vx *= 0.92; p.vy *= 0.92;
+    p.life -= p.decay;
+    return p.life > 0;
+  });
+
+  // Textos flutuantes
+  floatingTexts = floatingTexts.filter(t => {
+    t.y += t.vy; t.life -= 0.02;
+    return t.life > 0;
+  });
+}
+
+// ── Draw ─────────────────────────────────────────────
+function drawGlow(x, y, r, color) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, color);
+  g.addColorStop(1, 'transparent');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+}
+
+function draw() {
+  // Screen shake — só durante o jogo ativo
+  if (!documentVisible || state !== 'playing') shake = 0;
+  const sx = shake > 0 ? rand(-shake, shake) : 0;
+  const sy = shake > 0 ? rand(-shake, shake) : 0;
+
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  // Fundo
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  if (state === 'menu') { drawMenu(); ctx.restore(); return; }
+  if (state === 'dead') { drawDead(); ctx.restore(); return; }
+
+  // ── Câmara ──
+  ctx.save();
+  ctx.translate(-camX, -camY);
+
+  // Grid do mundo
+  ctx.strokeStyle = COL.grid;
+  ctx.lineWidth = 0.5;
+  const gridSize = 80;
+  for (let x = 0; x <= WORLD_W; x += gridSize) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, WORLD_H); ctx.stroke();
+  }
+  for (let y = 0; y <= WORLD_H; y += gridSize) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(WORLD_W, y); ctx.stroke();
+  }
+
+  // Bordas do mundo
+  ctx.strokeStyle = '#1a1a3a';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(2, 2, WORLD_W - 4, WORLD_H - 4);
+
+  // Partículas
+  particles.forEach(p => {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  // Projéteis
+  bullets.forEach(b => {
+    drawGlow(b.x, b.y, 14, COL.bulletGlow);
+    ctx.fillStyle = COL.bullet;
+    ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI * 2); ctx.fill();
+    // rastro
+    ctx.fillStyle = 'rgba(255,224,102,0.4)';
+    ctx.beginPath(); ctx.arc(b.x - b.vx * 2, b.y - b.vy * 2, 2.5, 0, Math.PI * 2); ctx.fill();
+  });
+
+  // Inimigos
+  enemies.forEach(e => {
+    drawGlow(e.x, e.y, e.r * 2.5, COL.enemyGlow[e.type]);
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.rotate(e.angle);
+
+    ctx.fillStyle = COL.enemy[e.type];
+    // Corpo triangular (aponta para o jogador)
+    ctx.beginPath();
+    ctx.moveTo(e.r, 0);
+    ctx.lineTo(-e.r * 0.7, -e.r * 0.7);
+    ctx.lineTo(-e.r * 0.7, e.r * 0.7);
+    ctx.closePath();
+    ctx.fill();
+
+    // Olho
+    ctx.fillStyle = '#111';
+    ctx.beginPath(); ctx.arc(e.r * 0.3, 0, e.r * 0.2, 0, Math.PI * 2); ctx.fill();
+
+    ctx.restore();
+
+    // Barra de vida
+    const bw = e.r * 2.5;
+    const bh = 4;
+    const bx = e.x - bw / 2;
+    const by = e.y - e.r - 10;
+    ctx.fillStyle = '#222';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = e.hp / e.maxHp > 0.4 ? '#2ecc71' : '#e74c3c';
+    ctx.fillRect(bx, by, bw * (e.hp / e.maxHp), bh);
+  });
+
+  // Jogador
+  const alpha = player.iframes > 0 && Math.floor(player.iframes / 4) % 2 === 0 ? 0.3 : 1;
+  ctx.globalAlpha = alpha;
+  drawGlow(player.x, player.y, player.r * 3, COL.playerGlow);
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  ctx.rotate(player.angle);
+
+  // Corpo
+  ctx.fillStyle = COL.player;
+  ctx.beginPath();
+  ctx.arc(0, 0, player.r, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Cano da arma
+  ctx.fillStyle = '#89cfef';
+  ctx.fillRect(player.r - 4, -3, 14, 6);
+  ctx.fillStyle = '#aae';
+  ctx.fillRect(player.r + 8, -2, 6, 4);
+
+  ctx.restore();
+  ctx.globalAlpha = 1;
+
+  // Mira (crosshair no mundo)
+  const wxc = mouse.x + camX;
+  const wyc = mouse.y + camY;
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 1;
+  const cs = 10;
+  ctx.beginPath(); ctx.moveTo(wxc - cs, wyc); ctx.lineTo(wxc + cs, wyc); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(wxc, wyc - cs); ctx.lineTo(wxc, wyc + cs); ctx.stroke();
+  ctx.beginPath(); ctx.arc(wxc, wyc, 4, 0, Math.PI * 2); ctx.stroke();
+
+  // Textos flutuantes
+  floatingTexts.forEach(t => {
+    ctx.globalAlpha = t.life;
+    ctx.fillStyle = t.color;
+    ctx.font = '500 13px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText(t.text, t.x, t.y);
+  });
+  ctx.globalAlpha = 1;
+
+  ctx.restore(); // fim câmara
+
+  // ── HUD ──────────────────────────────────────────
+  drawHUD();
+
+  ctx.restore(); // fim shake
+}
+
+function drawHUD() {
+  // Vida
+  ctx.fillStyle = '#111';
+  ctx.fillRect(16, 16, 180, 14);
+  const hpPct = player.hp / player.maxHp;
+  ctx.fillStyle = hpPct > 0.4 ? COL.hp : COL.hpLow;
+  ctx.fillRect(16, 16, 180 * hpPct, 14);
+  ctx.fillStyle = '#eee';
+  ctx.font = '11px Courier New';
+  ctx.textAlign = 'left';
+  ctx.fillText(`HP ${Math.ceil(player.hp)} / ${player.maxHp}`, 20, 27);
+
+  // XP
+  ctx.fillStyle = '#111';
+  ctx.fillRect(16, 34, 180, 8);
+  ctx.fillStyle = COL.xp;
+  ctx.fillRect(16, 34, 180 * (xp / player.xpToNext), 8);
+
+  // Ammo
+  ctx.fillStyle = '#eee';
+  ctx.font = '13px Courier New';
+  ctx.textAlign = 'left';
+  if (reloading) {
+    const pct = 1 - reloadTimer / 120;
+    ctx.fillStyle = '#f84';
+    ctx.fillText(`RECARREGANDO... ${Math.floor(pct * 100)}%`, 16, 58);
+  } else {
+    ctx.fillStyle = ammo > 3 ? '#ffe066' : '#f45';
+    ctx.fillText(`MUNIÇÃO  ${ammo} / ${maxAmmo}`, 16, 58);
+  }
+
+  // Stats topo direito
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#eee';
+  ctx.font = '13px Courier New';
+  ctx.fillText(`SCORE  ${score}`, W - 16, 28);
+  ctx.fillStyle = '#aaa';
+  ctx.font = '11px Courier New';
+  ctx.fillText(`ONDA ${wave}  ·  KILLS ${kills}  ·  LVL ${level}`, W - 16, 46);
+
+  // Indicador de onda
+  if (!waveActive && waveTimer > 0) {
+    const secs = Math.ceil(waveTimer / 60);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,224,102,0.8)';
+    ctx.font = '14px Courier New';
+    ctx.fillText(`próxima onda em ${secs}s`, W / 2, 28);
+  }
+
+  // Minimapa
+  const mmX = W - 130, mmY = H - 100, mmW = 114, mmH = 84;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(mmX, mmY, mmW, mmH);
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(mmX, mmY, mmW, mmH);
+
+  const sx2 = mmW / WORLD_W, sy2 = mmH / WORLD_H;
+  enemies.forEach(e => {
+    ctx.fillStyle = COL.enemy[e.type];
+    ctx.fillRect(mmX + e.x * sx2 - 1.5, mmY + e.y * sy2 - 1.5, 3, 3);
+  });
+  ctx.fillStyle = COL.player;
+  ctx.beginPath();
+  ctx.arc(mmX + player.x * sx2, mmY + player.y * sy2, 3, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawMenu() {
+  ctx.textAlign = 'center';
+
+  // Título
+  ctx.fillStyle = COL.player;
+  ctx.font = 'bold 52px Courier New';
+  ctx.fillText('TOP-DOWN', W / 2, H / 2 - 80);
+  ctx.fillStyle = '#ffe066';
+  ctx.fillText('SHOOTER', W / 2, H / 2 - 28);
+
+  ctx.fillStyle = '#666';
+  ctx.font = '13px Courier New';
+  ctx.fillText('WASD para mover  ·  Rato para mirar  ·  Clique para disparar  ·  R para recarregar', W / 2, H / 2 + 30);
+
+  ctx.fillStyle = '#aaa';
+  ctx.font = '14px Courier New';
+  ctx.fillText('Sobrevive a ondas de inimigos. Sobe de nível. Elimina tudo.', W / 2, H / 2 + 56);
+
+  // Botão
+  ctx.fillStyle = COL.player;
+  ctx.fillRect(W / 2 - 100, H / 2 + 90, 200, 44);
+  ctx.fillStyle = '#000';
+  ctx.font = 'bold 16px Courier New';
+  ctx.fillText('INICIAR  [ ENTER ]', W / 2, H / 2 + 117);
+}
+
+function drawDead() {
+  ctx.textAlign = 'center';
+
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = COL.hpLow;
+  ctx.font = 'bold 48px Courier New';
+  ctx.fillText('MORREU', W / 2, H / 2 - 80);
+
+  ctx.fillStyle = '#eee';
+  ctx.font = '16px Courier New';
+  ctx.fillText(`Score final: ${score}`, W / 2, H / 2 - 30);
+  ctx.fillText(`Ondas sobrevividas: ${wave}`, W / 2, H / 2);
+  ctx.fillText(`Inimigos eliminados: ${kills}`, W / 2, H / 2 + 30);
+  ctx.fillText(`Nível alcançado: ${level}`, W / 2, H / 2 + 60);
+
+  ctx.fillStyle = '#ffe066';
+  ctx.font = '14px Courier New';
+  ctx.fillText('[ ENTER ] para voltar ao menu', W / 2, H / 2 + 110);
+}
+
+// ── Loop principal ────────────────────────────────────
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>
